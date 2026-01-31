@@ -1,4 +1,4 @@
-use crate::proxy::config::{ProxyAuthMode, ProxyConfig, SecurityMonitorConfig};
+use crate::proxy::config::{ProxyAuthMode, ProxyConfig};
 
 #[derive(Debug, Clone)]
 pub struct ProxySecurityConfig {
@@ -7,7 +7,6 @@ pub struct ProxySecurityConfig {
     pub admin_password: Option<String>,
     pub allow_lan_access: bool,
     pub port: u16,
-    pub security_monitor: SecurityMonitorConfig,
 }
 
 impl ProxySecurityConfig {
@@ -18,7 +17,6 @@ impl ProxySecurityConfig {
             admin_password: config.admin_password.clone(),
             allow_lan_access: config.allow_lan_access,
             port: config.port,
-            security_monitor: config.security_monitor.clone(),
         }
     }
 
@@ -48,7 +46,6 @@ mod tests {
             admin_password: None,
             allow_lan_access: false,
             port: 8080,
-            security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
         };
         assert!(matches!(s.effective_auth_mode(), ProxyAuthMode::Off));
     }
@@ -61,7 +58,6 @@ mod tests {
             admin_password: None,
             allow_lan_access: true,
             port: 8080,
-            security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
         };
         assert!(matches!(
             s.effective_auth_mode(),

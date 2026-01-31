@@ -319,7 +319,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
     let mut retry_count = 0;
     
     loop {
-        let target_accounts = crate::modules::account::list_accounts().unwrap_or_default();
+        let target_accounts = crate::modules::account::list_accounts().await.unwrap_or_default();
 
         if target_accounts.is_empty() {
             return Ok("No accounts available".to_string());
@@ -354,14 +354,9 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                         if m.percentage >= 100 {
                             let model_to_ping = m.name.clone();
                             
-                            match model_to_ping.as_str() {
-                                "gemini-3-flash" | "claude-sonnet-4-5" | "gemini-3-pro-high" | "gemini-3-pro-image" => {
-                                    if !account_warmed_series.contains(&model_to_ping) {
-                                        warmup_items.push((email.clone(), model_to_ping.clone(), token.clone(), pid.clone(), m.percentage));
-                                        account_warmed_series.insert(model_to_ping);
-                                    }
-                                }
-                                _ => continue,
+                            if !account_warmed_series.contains(&model_to_ping) {
+                                warmup_items.push((email.clone(), model_to_ping.clone(), token.clone(), pid.clone(), m.percentage));
+                                account_warmed_series.insert(model_to_ping);
                             }
                         } else if m.percentage >= NEAR_READY_THRESHOLD {
                             has_near_ready_models = true;
@@ -460,7 +455,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
 /// Warmup for single account
 pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
-    let accounts = crate::modules::account::list_accounts().unwrap_or_default();
+    let accounts = crate::modules::account::list_accounts().await.unwrap_or_default();
     let account_owned = accounts.iter().find(|a| a.id == account_id).cloned().ok_or_else(|| "Account not found".to_string())?;
     
     let email = account_owned.email.clone();
@@ -475,14 +470,9 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
             let model_name = m.name.clone();
             
             // 2. Strict whitelist filtering
-            match model_name.as_str() {
-                "gemini-3-flash" | "claude-sonnet-4-5" | "gemini-3-pro-high" | "gemini-3-pro-image" => {
-                    if !warmed_series.contains(&model_name) {
-                        models_to_warm.push((model_name.clone(), m.percentage));
-                        warmed_series.insert(model_name);
-                    }
-                }
-                _ => continue,
+            if !warmed_series.contains(&model_name) {
+                models_to_warm.push((model_name.clone(), m.percentage));
+                warmed_series.insert(model_name);
             }
         }
     }

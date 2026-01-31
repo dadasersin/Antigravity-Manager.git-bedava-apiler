@@ -115,16 +115,12 @@ pub async fn internal_start_proxy_service(
     
     let _monitor = state.monitor.read().await.as_ref().unwrap().clone();
     
-    // 檢查並啟動管理服務器（如果尚未運行）
-    ensure_admin_server(config.clone(), state, integration.clone(), cloudflared_state.clone()).await?;
-
-    // 2. [FIX] 复用管理服务器的 Token 管理器 (单实例，解决热更新同步问题)
-    let token_manager = {
-        let admin_lock = state.admin_server.read().await;
-        admin_lock.as_ref().unwrap().axum_server.token_manager.clone()
-    };
+    // 2. 初始化 Token 管理器
+    let app_data_dir = crate::modules::account::get_data_dir()?;
+    let _ = crate::modules::account::get_accounts_dir()?;
+    let accounts_dir = app_data_dir.clone();
     
-    // 同步配置到运行中的 TokenManager
+    let token_manager = Arc::new(TokenManager::new(accounts_dir));
     token_manager.start_auto_cleanup();
     token_manager.update_sticky_config(config.scheduling.clone()).await;
     
@@ -132,11 +128,8 @@ pub async fn internal_start_proxy_service(
     let app_config = crate::modules::config::load_app_config().unwrap_or_else(|_| crate::models::AppConfig::new());
     token_manager.update_circuit_breaker_config(app_config.circuit_breaker).await;
 
-    // 🆕 [FIX #820] 恢复固定账号模式设置
-    if let Some(ref account_id) = config.preferred_account_id {
-        token_manager.set_preferred_account(Some(account_id.clone())).await;
-        tracing::info!("🔒 [FIX #820] Fixed account mode restored: {}", account_id);
-    }
+    // 檢查並啟動管理服務器（如果尚未運行）
+    ensure_admin_server(config.clone(), state, integration.clone(), cloudflared_state.clone()).await?;
 
     // 3. 加載賬號
     let active_accounts = token_manager.load_accounts().await
@@ -223,7 +216,6 @@ pub async fn ensure_admin_server(
             config.custom_mapping.clone(),
             config.request_timeout,
             config.upstream_proxy.clone(),
-            config.user_agent_override.clone(),
             crate::proxy::ProxySecurityConfig::from_proxy_config(&config),
             config.zai.clone(),
             monitor,
@@ -289,7 +281,7 @@ pub async fn get_proxy_status(
                     running: true,
                     port: instance.config.port,
                     base_url: format!("http://127.0.0.1:{}", instance.config.port),
-                    active_accounts: instance.token_manager.len(),
+                    active_accounts: instance.token_manager.effective_len().await,
                 }),
                 None => Ok(ProxyStatus {
                     running: false,
@@ -648,55 +640,6 @@ pub async fn clear_proxy_session_bindings(
         Ok(())
     } else {
         Err("服务未运行".to_string())
-    }
-}
-
-// ===== [FIX #820] 固定账号模式命令 =====
-
-/// 设置优先使用的账号（固定账号模式）
-/// 传入 account_id 启用固定模式，传入 null/空字符串恢复轮询模式
-#[tauri::command]
-pub async fn set_preferred_account(
-    state: State<'_, ProxyServiceState>,
-    account_id: Option<String>,
-) -> Result<(), String> {
-    let instance_lock = state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
-        // 过滤空字符串为 None
-        let cleaned_id = account_id.filter(|s| !s.trim().is_empty());
-
-        // 1. 更新内存状态
-        instance.token_manager.set_preferred_account(cleaned_id.clone()).await;
-
-        // 2. 持久化到配置文件 (修复 Issue #820 自动关闭问题)
-        let mut app_config = crate::modules::config::load_app_config()
-            .map_err(|e| format!("加载配置失败: {}", e))?;
-        app_config.proxy.preferred_account_id = cleaned_id.clone();
-        crate::modules::config::save_app_config(&app_config)
-            .map_err(|e| format!("保存配置失败: {}", e))?;
-
-        if let Some(ref id) = cleaned_id {
-            tracing::info!("🔒 [FIX #820] Fixed account mode enabled and persisted: {}", id);
-        } else {
-            tracing::info!("🔄 [FIX #820] Round-robin mode enabled and persisted");
-        }
-
-        Ok(())
-    } else {
-        Err("服务未运行".to_string())
-    }
-}
-
-/// 获取当前优先使用的账号ID
-#[tauri::command]
-pub async fn get_preferred_account(
-    state: State<'_, ProxyServiceState>,
-) -> Result<Option<String>, String> {
-    let instance_lock = state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
-        Ok(instance.token_manager.get_preferred_account().await)
-    } else {
-        Ok(None)
     }
 }
 

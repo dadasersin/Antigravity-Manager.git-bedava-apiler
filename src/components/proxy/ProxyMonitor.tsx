@@ -123,7 +123,7 @@ const LogTable: React.FC<LogTableProps> = ({
             {loading && (
                 <div className="flex items-center justify-center p-4 bg-white dark:bg-base-100">
                     <div className="loading loading-spinner loading-md"></div>
-                    <span className="ml-3 text-sm text-gray-500">{t('common.loading')}</span>
+                    <span className="ml-3 text-sm text-gray-500">{t('common.loading') || 'Loading...'}</span>
                 </div>
             )}
 
@@ -244,8 +244,6 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     };
 
     const totalPages = Math.ceil(totalCount / pageSize);
-    const pageStart = totalCount === 0 ? 0 : (currentPage - 1) * pageSize + 1;
-    const pageEnd = totalCount === 0 ? 0 : Math.min(currentPage * pageSize, totalCount);
 
     const goToPage = (page: number) => {
         if (page >= 1 && page <= totalPages && page !== currentPage) {
@@ -482,12 +480,12 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                     </div>
 
                     <div className="hidden lg:flex gap-4 text-[10px] font-bold uppercase">
-                        <span className="text-blue-500">{formatCompactNumber(stats.total_requests)} {t('monitor.stats.total')}</span>
-                        <span className="text-green-500">{formatCompactNumber(stats.success_count)} {t('monitor.stats.ok')}</span>
-                        <span className="text-red-500">{formatCompactNumber(stats.error_count)} {t('monitor.stats.err')}</span>
+                        <span className="text-blue-500">{formatCompactNumber(stats.total_requests)} REQS</span>
+                        <span className="text-green-500">{formatCompactNumber(stats.success_count)} OK</span>
+                        <span className="text-red-500">{formatCompactNumber(stats.error_count)} ERR</span>
                     </div>
 
-                    <button onClick={() => loadData(currentPage, filter)} className="btn btn-sm btn-ghost text-gray-400" title={t('common.refresh')}>
+                    <button onClick={() => loadData(currentPage, filter)} className="btn btn-sm btn-ghost text-gray-400" title={t('common.refresh') || 'Refresh'}>
                         <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                     </button>
                     <button onClick={clearLogs} className="btn btn-sm btn-ghost text-gray-400">
@@ -527,7 +525,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             {/* Pagination Controls */}
             <div className="flex items-center justify-between px-4 py-3 bg-gray-50 dark:bg-base-200 border-t border-gray-200 dark:border-base-300 text-xs">
                 <div className="flex items-center gap-2 whitespace-nowrap">
-                    <span className="text-gray-500">{t('common.per_page')}</span>
+                    <span className="text-gray-500">Per page</span>
                     <select
                         value={pageSize}
                         onChange={(e) => setPageSize(Number(e.target.value))}
@@ -560,7 +558,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 </div>
 
                 <div className="text-gray-500">
-                    {t('common.pagination_info', { start: pageStart, end: pageEnd, total: totalCount })}
+                    Total {totalCount} records
                 </div>
             </div>
 

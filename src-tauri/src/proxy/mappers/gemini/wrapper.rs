@@ -52,13 +52,9 @@ pub fn wrap_request(body: &Value, project_id: &str, mapped_model: &str, session_
                         if budget > 24576 {
                             thinking_config["thinkingBudget"] = json!(24576);
                             tracing::info!(
-                                "[Gemini-Wrap] Capped thinking_budget from {} to 24576 for model {}", 
+                                "[Gemini-Wrap] Capped thinking_budget from {} to 24576 for Flash model {}", 
                                 budget, final_model_name
                             );
-                            
-                            // Also Ensure maxOutputTokens is adjusted if strict limits are needed (optional but good practice)
-                            // But for native Gemini, we usually trust the user or defaults unless specifically problematic.
-                            // The error explicitly mentions thinking_budget, so we focus on that.
                         }
                     }
                 }
@@ -272,42 +268,15 @@ mod tests {
         
         // 验证 systemInstruction
         let sys = result.get("request").unwrap().get("systemInstruction").unwrap();
-    }
-
-    #[test]
-    fn test_gemini_flash_thinking_budget_capping() {
-        let body = json!({
-            "model": "gemini-2.0-flash-thinking-exp",
-            "generationConfig": {
-                "thinkingConfig": {
-                    "includeThoughts": true,
-                    "thinkingBudget": 32000
-                }
-            }
-        });
-
-        // Test with Flash model
-        let result = wrap_request(&body, "test-proj", "gemini-2.0-flash-thinking-exp", None);
-        let req = result.get("request").unwrap();
-        let gen_config = req.get("generationConfig").unwrap();
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"].as_u64().unwrap();
-
-        // Should be capped at 24576
-        assert_eq!(budget, 24576);
-
-        // Test with Pro model (should NOT cap)
-        let body_pro = json!({
-            "model": "gemini-2.0-pro-exp",
-            "generationConfig": {
-                "thinkingConfig": {
-                    "includeThoughts": true,
-                    "thinkingBudget": 32000
-                }
-            }
-        });
-        let result_pro = wrap_request(&body_pro, "test-proj", "gemini-2.0-pro-exp", None);
-        let budget_pro = result_pro["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"].as_u64().unwrap();
-        assert_eq!(budget_pro, 32000);
+        
+        // 1. 验证 role: "user"
+        assert_eq!(sys.get("role").unwrap(), "user");
+        
+        // 2. 验证 Antigravity 身份注入
+        let parts = sys.get("parts").unwrap().as_array().unwrap();
+        assert!(!parts.is_empty());
+        let first_text = parts[0].get("text").unwrap().as_str().unwrap();
+        assert!(first_text.contains("You are Antigravity"));
     }
 
     #[test]
@@ -345,6 +314,40 @@ mod tests {
 
         // Should NOT inject duplicate, so only 1 part remains
         assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn test_gemini_flash_thinking_budget_capping() {
+        let body = json!({
+            "model": "gemini-2.0-flash-thinking-exp",
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 32000
+                }
+            }
+        });
+
+        // Test with Flash model - should cap at 24576
+        let result = wrap_request(&body, "test-proj", "gemini-2.0-flash-thinking-exp", None);
+        let req = result.get("request").unwrap();
+        let gen_config = req.get("generationConfig").unwrap();
+        let budget = gen_config["thinkingConfig"]["thinkingBudget"].as_u64().unwrap();
+        assert_eq!(budget, 24576);
+
+        // Test with Pro model - should NOT cap
+        let body_pro = json!({
+            "model": "gemini-2.0-pro-exp",
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 32000
+                }
+            }
+        });
+        let result_pro = wrap_request(&body_pro, "test-proj", "gemini-2.0-pro-exp", None);
+        let budget_pro = result_pro["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"].as_u64().unwrap();
+        assert_eq!(budget_pro, 32000);
     }
 
     #[test]

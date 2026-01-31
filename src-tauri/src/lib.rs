@@ -60,12 +60,6 @@ pub fn run() {
     if let Err(e) = modules::token_stats::init_db() {
         error!("Failed to initialize token stats database: {}", e);
     }
-
-    // Initialize security database
-    if let Err(e) = modules::security_db::init_db() {
-        error!("Failed to initialize security database: {}", e);
-    }
-
     
     if is_headless {
         info!("Starting in HEADLESS mode...");
@@ -174,7 +168,7 @@ pub fn run() {
         return;
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
@@ -184,8 +178,11 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_window_state::Builder::default().build());
+
+        // Single instance plugin - only in release builds (controlled by feature flag)
+        #[cfg(feature = "single-instance")]
+        let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = app.get_webview_window("main")
                 .map(|window| {
                     let _ = window.show();
@@ -193,11 +190,15 @@ pub fn run() {
                     #[cfg(target_os = "macos")]
                     app.set_activation_policy(tauri::ActivationPolicy::Regular).unwrap_or(());
                 });
-        }))
-        .manage(commands::proxy::ProxyServiceState::new())
+        }));
+
+        builder.manage(commands::proxy::ProxyServiceState::new())
         .manage(commands::cloudflared::CloudflaredState::new())
         .setup(|app| {
             info!("Setup starting...");
+
+            // Initialize log bridge with app handle for debug console
+            modules::log_bridge::init_log_bridge(app.handle().clone());
 
             // Linux: Workaround for transparent window crash/freeze
             // The transparent window feature is unstable on Linux with WebKitGTK
@@ -322,8 +323,6 @@ pub fn run() {
             commands::save_text_file,
             commands::read_text_file,
             commands::clear_log_cache,
-            commands::clear_antigravity_cache,
-            commands::get_antigravity_cache_paths,
             commands::open_data_folder,
             commands::get_data_dir_path,
             commands::show_main_window,
@@ -358,8 +357,6 @@ pub fn run() {
             commands::proxy::get_proxy_scheduling_config,
             commands::proxy::update_proxy_scheduling_config,
             commands::proxy::clear_proxy_session_bindings,
-            commands::proxy::set_preferred_account,
-            commands::proxy::get_preferred_account,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
             // Autostart commands
@@ -386,29 +383,18 @@ pub fn run() {
             proxy::cli_sync::execute_cli_sync,
             proxy::cli_sync::execute_cli_restore,
             proxy::cli_sync::get_cli_config_content,
-            // Security/IP monitoring commands
-            commands::security::get_ip_access_logs,
-            commands::security::get_ip_stats,
-            commands::security::get_ip_token_stats,
-            commands::security::clear_ip_access_logs,
-            commands::security::get_ip_blacklist,
-            commands::security::add_ip_to_blacklist,
-            commands::security::remove_ip_from_blacklist,
-            commands::security::clear_ip_blacklist,
-            commands::security::check_ip_in_blacklist,
-            commands::security::get_ip_whitelist,
-            commands::security::add_ip_to_whitelist,
-            commands::security::remove_ip_from_whitelist,
-            commands::security::clear_ip_whitelist,
-            commands::security::check_ip_in_whitelist,
-            commands::security::get_security_config,
-            commands::security::update_security_config,
             // Cloudflared commands
             commands::cloudflared::cloudflared_check,
             commands::cloudflared::cloudflared_install,
             commands::cloudflared::cloudflared_start,
             commands::cloudflared::cloudflared_stop,
             commands::cloudflared::cloudflared_get_status,
+            // Debug console commands
+            modules::log_bridge::enable_debug_console,
+            modules::log_bridge::disable_debug_console,
+            modules::log_bridge::is_debug_console_enabled,
+            modules::log_bridge::get_debug_console_logs,
+            modules::log_bridge::clear_debug_console_logs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

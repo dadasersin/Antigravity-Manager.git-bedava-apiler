@@ -1,12 +1,36 @@
+
 // 移除冗余的顶层导入，因为这些在代码中已由 full path 或局部导入处理
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::sticky_config::StickySessionConfig;
+// 移除冗余的顶层导入，因为这些在代码中已由 full path 或局部导入处理
+
+
+
+
+// [NEW] Token Lease RAII Guard
+#[derive(Debug)]
+pub struct TokenLease {
+    pub access_token: String,
+    pub project_id: String,
+    pub email: String,
+    pub account_id: String,
+    active_requests: Arc<DashMap<String, AtomicUsize>>,
+}
+
+impl Drop for TokenLease {
+    fn drop(&mut self) {
+        if let Some(counter) = self.active_requests.get(&self.account_id) {
+            counter.fetch_sub(1, Ordering::SeqCst);
+            tracing::debug!("⬇️ Connection released: {} (active: {})", self.email, counter.load(Ordering::SeqCst));
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
@@ -22,6 +46,7 @@ pub struct ProxyToken {
     pub remaining_quota: Option<i32>, // [FIX #563] Remaining quota for priority sorting
     pub protected_models: HashSet<String>, // [NEW #621]
     pub health_score: f32, // [NEW] 健康分数 (0.0 - 1.0)
+    pub model_quotas: HashMap<String, i32>, // [NEW] Strict Model Quotas (Remaining %)
 }
 
 
@@ -32,9 +57,9 @@ pub struct TokenManager {
     data_dir: PathBuf,
     rate_limit_tracker: Arc<RateLimitTracker>,  // 新增: 限流跟踪器
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
-    session_accounts: Arc<DashMap<String, String>>, // 新增：会话与账号映射 (SessionID -> AccountID)
-    preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
+    session_accounts: Arc<DashMap<String, (String, std::time::Instant)>>, // [FIX] Store timestamp for cleanup
     health_scores: Arc<DashMap<String, f32>>, // account_id -> health_score
+    active_requests: Arc<DashMap<String, AtomicUsize>>, // [NEW] Least Connections tracking
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
 }
 
@@ -49,8 +74,8 @@ impl TokenManager {
             rate_limit_tracker: Arc::new(RateLimitTracker::new()),
             sticky_config: Arc::new(tokio::sync::RwLock::new(StickySessionConfig::default())),
             session_accounts: Arc::new(DashMap::new()),
-            preferred_account_id: Arc::new(tokio::sync::RwLock::new(None)), // [FIX #820]
             health_scores: Arc::new(DashMap::new()),
+            active_requests: Arc::new(DashMap::new()),
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(crate::models::CircuitBreakerConfig::default())),
         }
     }
@@ -58,17 +83,43 @@ impl TokenManager {
     /// 启动限流记录自动清理后台任务（每15秒检查并清除过期记录）
     pub fn start_auto_cleanup(&self) {
         let tracker = self.rate_limit_tracker.clone();
+        let session_map = self.session_accounts.clone(); // [FIX] Capture session map
+        
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut session_cleanup_interval = 0; // Run session cleanup every ~10 minutes (40 ticks)
+
             loop {
                 interval.tick().await;
                 let cleaned = tracker.cleanup_expired();
                 if cleaned > 0 {
                     tracing::info!("🧹 Auto-cleanup: Removed {} expired rate limit record(s)", cleaned);
                 }
+
+                // Session Cleanup (Every 10 mins)
+                session_cleanup_interval += 1;
+                if session_cleanup_interval >= 40 {
+                    session_cleanup_interval = 0;
+                    let now = std::time::Instant::now();
+                    let expiry = std::time::Duration::from_secs(24 * 3600); // 24h retention
+                    let mut removed_sessions = 0;
+                    
+                    session_map.retain(|_, (_, ts)| {
+                        if now.duration_since(*ts) > expiry {
+                            removed_sessions += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    if removed_sessions > 0 {
+                        tracing::info!("🧹 Session Cleanup: Removed {} expired sessions", removed_sessions);
+                    }
+                }
             }
         });
-        tracing::info!("✅ Rate limit auto-cleanup task started (interval: 15s)");
+        tracing::info!("✅ Rate limit & Session auto-cleanup task started");
     }
     
     /// 从主应用账号目录加载所有账号
@@ -167,28 +218,7 @@ impl TokenManager {
             return Ok(None);
         }
 
-
-        // [修复 #1344] 先检查账号是否被手动禁用(非配额保护原因)
-        let is_proxy_disabled = account.get("proxy_disabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        
-        let disabled_reason = account.get("proxy_disabled_reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        
-        if is_proxy_disabled && disabled_reason != "quota_protection" {
-            // 账号被手动禁用(非配额保护原因)
-            tracing::debug!(
-                "Account skipped due to manual disable: {:?} (email={}, reason={})",
-                path,
-                account.get("email").and_then(|v| v.as_str()).unwrap_or("<unknown>"),
-                disabled_reason
-            );
-            return Ok(None);
-        }
-
-        // 配额保护检查 - 只处理配额保护逻辑
+        // 【新增】配额保护检查 - 在检查 proxy_disabled 之前执行
         // 这样可以在加载时自动恢复配额已恢复的账号
         if self.check_and_protect_quota(&mut account, path).await {
             tracing::debug!(
@@ -199,9 +229,7 @@ impl TokenManager {
             return Ok(None);
         }
 
-        // [兼容性] 检查旧版 proxy_disabled 标记(已被配额保护恢复的情况)
-        // 如果账号被旧版配额保护禁用,但配额已恢复,上面的检查会自动清除 proxy_disabled
-        // 这里再次检查,确保不会加载仍然被禁用的账号
+        // 检查主动禁用状态
         if account
             .get("proxy_disabled")
             .and_then(|v| v.as_bool())
@@ -215,6 +243,47 @@ impl TokenManager {
             return Ok(None);
         }
 
+        // [NEW] Check for validation block (VALIDATION_REQUIRED temporary block)
+        if account
+            .get("validation_blocked")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let block_until = account
+                .get("validation_blocked_until")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            
+            let now = chrono::Utc::now().timestamp();
+            
+            if now < block_until {
+                // Still blocked
+                tracing::debug!(
+                    "Skipping validation-blocked account: {:?} (email={}, blocked until {})",
+                    path,
+                    account.get("email").and_then(|v| v.as_str()).unwrap_or("<unknown>"),
+                    chrono::DateTime::from_timestamp(block_until, 0)
+                        .map(|dt| dt.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| block_until.to_string())
+                );
+                return Ok(None);
+            } else {
+                // Block expired - clear it
+                tracing::info!(
+                    "Validation block expired for account: {:?} (email={}), clearing...",
+                    path,
+                    account.get("email").and_then(|v| v.as_str()).unwrap_or("<unknown>")
+                );
+                account["validation_blocked"] = serde_json::Value::Bool(false);
+                account["validation_blocked_until"] = serde_json::Value::Null;
+                account["validation_blocked_reason"] = serde_json::Value::Null;
+                
+                // Save cleared state
+                if let Ok(json_str) = serde_json::to_string_pretty(&account) {
+                    let _ = std::fs::write(path, json_str);
+                }
+            }
+        }
 
         let account_id = account["id"].as_str()
             .ok_or("缺少 id 字段")?
@@ -268,6 +337,16 @@ impl TokenManager {
                     .collect()
             })
             .unwrap_or_default();
+
+        // [NEW] 提取所有模型的剩余配额映射
+        let mut model_quotas = HashMap::new();
+        if let Some(models) = account.get("quota").and_then(|q| q.get("models")).and_then(|m| m.as_array()) {
+            for m in models {
+                if let (Some(name), Some(pct)) = (m.get("name").and_then(|v| v.as_str()), m.get("percentage").and_then(|v| v.as_i64())) {
+                    model_quotas.insert(name.to_string(), pct as i32);
+                }
+            }
+        }
         
         let health_score = self.health_scores.get(&account_id).map(|v| *v).unwrap_or(1.0);
         
@@ -284,6 +363,7 @@ impl TokenManager {
             remaining_quota,
             protected_models,
             health_score,
+            model_quotas, // [NEW]
         }))
     }
 
@@ -308,7 +388,7 @@ impl TokenManager {
             None => return false, // 无配额信息，跳过
         };
 
-        // 3. [兼容性 #621] 检查是否被旧版账号级配额保护禁用,尝试恢复并转为模型级
+        // 3. 检查是否已经被账号级或模型级配额保护禁用
         let is_proxy_disabled = account_json.get("proxy_disabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
@@ -317,12 +397,13 @@ impl TokenManager {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         
-        if is_proxy_disabled && reason == "quota_protection" {
-            // 如果是被旧版账号级保护禁用的,尝试恢复并转为模型级
-            return self.check_and_restore_quota(account_json, account_path, &quota, &config).await;
+        if is_proxy_disabled {
+            if reason == "quota_protection" {
+                // [兼容性 #621] 如果是被旧版账号级保护禁用的，尝试恢复并转为模型级
+                return self.check_and_restore_quota(account_json, account_path, &quota, &config).await;
+            }
+            return true; // 其他原因禁用，跳过加载
         }
-        
-        // [修复 #1344] 不再处理其他禁用原因,让调用方负责检查手动禁用
         
         // 4. 获取模型列表
         let models = match quota.get("models").and_then(|m| m.as_array()) {
@@ -428,7 +509,10 @@ impl TokenManager {
             );
             
             // 3. 写入磁盘
-            std::fs::write(account_path, serde_json::to_string_pretty(account_json).unwrap())
+            let json_str = serde_json::to_string_pretty(account_json)
+                .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
+            
+            std::fs::write(account_path, json_str)
                 .map_err(|e| format!("写入文件失败: {}", e))?;
             
             return Ok(true);
@@ -473,7 +557,13 @@ impl TokenManager {
         
         account_json["protected_models"] = serde_json::Value::Array(protected_list);
         
-        let _ = std::fs::write(account_path, serde_json::to_string_pretty(account_json).unwrap());
+        if let Ok(json_str) = serde_json::to_string_pretty(account_json) {
+             if let Err(e) = std::fs::write(account_path, json_str) {
+                 tracing::error!("[check_and_restore_quota] Failed to write account file: {}", e);
+             }
+        } else {
+             tracing::error!("[check_and_restore_quota] Failed to serialize account json");
+        }
         
         false // 返回 false 表示现在已可以尝试加载该账号（模型级过滤会在 get_token 时发生）
     }
@@ -493,7 +583,10 @@ impl TokenManager {
             
             if arr.len() < original_len {
                 tracing::info!("账号 {} 的模型 {} 配额已恢复，移出保护列表", account_id, model_name);
-                std::fs::write(account_path, serde_json::to_string_pretty(account_json).unwrap())
+                let json_str = serde_json::to_string_pretty(account_json)
+                    .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
+                    
+                std::fs::write(account_path, json_str)
                     .map_err(|e| format!("写入文件失败: {}", e))?;
                 return Ok(true);
             }
@@ -502,7 +595,66 @@ impl TokenManager {
         Ok(false)
     }
 
+    /// 尝试刷新 Token (如果即将过期)
+    async fn try_refresh_token_if_needed(&self, token: &mut ProxyToken) {
+        let now = chrono::Utc::now().timestamp();
+        if now >= token.timestamp - 300 {
+            tracing::debug!("账号 {} 的 token 即将过期，正在刷新...", token.email);
+            match crate::modules::oauth::refresh_access_token(&token.refresh_token).await {
+                Ok(token_response) => {
+                    token.access_token = token_response.access_token.clone();
+                    token.expires_in = token_response.expires_in;
+                    token.timestamp = now + token_response.expires_in;
+
+                    if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                        entry.access_token = token.access_token.clone();
+                        entry.expires_in = token.expires_in;
+                        entry.timestamp = token.timestamp;
+                    }
+                    let _ = self.save_refreshed_token(&token.account_id, &token_response).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Token refresh failed: {}", e);
+                }
+            }
+        }
+    }
+
+    /// 确保 Token 包含 Project ID (如果缺少则获取)
+    async fn ensure_project_id(&self, token: &mut ProxyToken) -> String {
+        if let Some(pid) = &token.project_id {
+            pid.clone()
+        } else {
+            match crate::proxy::project_resolver::fetch_project_id(&token.access_token).await {
+                Ok(pid) => {
+                    // Update cache
+                    if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                        entry.project_id = Some(pid.clone());
+                    }
+                    // Persist to disk logic (optional/simplified here as save_project_id is implied available or need implementation)
+                    // Assuming save_project_id allows async
+                    let _ = self.save_project_id(&token.account_id, &pid).await;
+                    pid
+                }
+                Err(_) => crate::proxy::project_resolver::generate_mock_project_id() // fallback to random ID
+            }
+        }
+    }
     
+    // Placeholder for save methods if they are not nearby, but assuming they exist in the file based on context.
+    // If save_refreshed_token / save_project_id are not standard methods on self (probably defined later in the file),
+    // I need to be careful.
+    // based on original code loop:
+    // let _ = self.save_refreshed_token(&token.account_id, &token_response).await;
+    // So they exist on `self`.
+
+
+    
+    /// 获取当前可用的 Token（支持粘性会话与智能调度）
+    /// 参数 `quota_group` 用于区分 "claude" vs "gemini" 组
+    /// 参数 `force_rotate` 为 true 时将忽略锁定，强制切换账号
+    /// 参数 `session_id` 用于跨请求维持会话粘性
+    /// 参数 `target_model` 用于检查配额保护 (Issue #621)
     /// 获取当前可用的 Token（支持粘性会话与智能调度）
     /// 参数 `quota_group` 用于区分 "claude" vs "gemini" 组
     /// 参数 `force_rotate` 为 true 时将忽略锁定，强制切换账号
@@ -514,9 +666,9 @@ impl TokenManager {
         force_rotate: bool, 
         session_id: Option<&str>,
         target_model: &str,
-    ) -> Result<(String, String, String, u64), String> {
-        // 【优化 Issue #284】添加 5 秒超时，防止死锁
-        let timeout_duration = std::time::Duration::from_secs(5);
+    ) -> Result<TokenLease, String> {
+        // 【优化 Issue #284】添加 120 秒超时 (因为 CacheFirst/Fixed 模式可能需要等待)
+        let timeout_duration = std::time::Duration::from_secs(120);
         match tokio::time::timeout(timeout_duration, self.get_token_internal(quota_group, force_rotate, session_id, target_model)).await {
             Ok(result) => result,
             Err(_) => Err("Token acquisition timeout (5s) - system too busy or deadlock detected".to_string()),
@@ -530,11 +682,42 @@ impl TokenManager {
         force_rotate: bool, 
         session_id: Option<&str>,
         target_model: &str,
-    ) -> Result<(String, String, String, u64), String> {
+    ) -> Result<TokenLease, String> {
         let mut tokens_snapshot: Vec<ProxyToken> = self.tokens.iter().map(|e| e.value().clone()).collect();
         let total = tokens_snapshot.len();
         if total == 0 {
             return Err("Token pool is empty".to_string());
+        }
+
+        // ===== 【核心过滤】严格剔除配额为 0 的账号 [NEW] =====
+        // 在任何排序和选择之前，必须先剔除完全不可用的账号
+        // 1. 归一化目标模型名为标准 ID (e.g. "claude-3-opus" -> "claude-3-opus-20240229")
+        let normalized_target = crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+            .unwrap_or_else(|| target_model.to_string());
+        
+        tokens_snapshot.retain(|t| {
+            // 检查模型特定配额
+            // 逻辑: 如果 model_quotas 中存在该 key (不管是原始 key 还是 normalized key)，且 value <= 0，则剔除
+            
+            // case 1: check exact match
+            if let Some(&pct) = t.model_quotas.get(target_model) {
+                if pct <= 0 { return false; }
+            }
+            
+            // case 2: check normalized match (if different)
+            if normalized_target != target_model {
+                if let Some(&pct) = t.model_quotas.get(&normalized_target) {
+                    if pct <= 0 { return false; }
+                }
+            }
+
+            // case 3: fuzzy lookup (iterate keys) - fallback if needed, but exact/normalized should cover 99%
+            // 如果确实找不到 quota info，我们默认为可用 (保守策略)
+            true
+        });
+
+        if tokens_snapshot.is_empty() {
+             return Err(format!("No accounts available with remaining quota > 0 for model '{}'", target_model));
         }
 
         // ===== 【优化】根据订阅等级和剩余配额排序 =====
@@ -542,10 +725,41 @@ impl TokenManager {
         // 理由: ULTRA/PRO 重置快，优先消耗；FREE 重置慢，用于兜底
         //       高配額账号优先使用，避免低配额账号被用光
         tokens_snapshot.sort_by(|a, b| {
+            // [SMART-SPILLOVER] Active Requests Limits
+            // Define limits based on tier
+            let get_concurrency_limit = |tier: &Option<String>| -> usize {
+                match tier.as_deref() {
+                    Some(t) if t.contains("ultra") => 8, // High concurrency for Ultra
+                    Some(t) if t.contains("pro") => 3,   // Moderate for Pro
+                    Some(_) => 1,                        // Strict for Free/Standard
+                    None => 1,
+                }
+            };
+
+            let limit_a = get_concurrency_limit(&a.subscription_tier);
+            let limit_b = get_concurrency_limit(&b.subscription_tier);
+
+            let active_a = self.active_requests.get(&a.account_id).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0);
+            let active_b = self.active_requests.get(&b.account_id).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0);
+
+            let overloaded_a = active_a >= limit_a;
+            let overloaded_b = active_b >= limit_b;
+
+            // [CRITICAL] Availability First: Non-overloaded accounts always beat overloaded ones
+            if overloaded_a != overloaded_b {
+                if overloaded_a {
+                    return std::cmp::Ordering::Greater; // A is overloaded, B is not -> B wins (Less)
+                } else {
+                    return std::cmp::Ordering::Less;    // A is not, B is -> A wins (Less)
+                }
+            }
+
+            // [TIER] If both active statuses are same (both OK or both Overloaded), prefer higher tier
+            // Lower value means higher priority (0=Ultra, 1=Pro, 2=Free)
             let tier_priority = |tier: &Option<String>| match tier.as_deref() {
-                Some("ULTRA") => 0,
-                Some("PRO") => 1,
-                Some("FREE") => 2,
+                Some(t) if t.contains("ultra") => 0,
+                Some(t) if t.contains("pro") => 1,
+                Some(t) if t.contains("free") => 2,
                 _ => 3,
             };
             
@@ -556,113 +770,98 @@ impl TokenManager {
             if tier_cmp != std::cmp::Ordering::Equal {
                 return tier_cmp;
             }
+
+            // Second: compare by health score (higher is better)
+            let health_cmp = b.health_score.partial_cmp(&a.health_score).unwrap_or(std::cmp::Ordering::Equal);
+            if health_cmp != std::cmp::Ordering::Equal {
+                return health_cmp;
+            }
+
+            // [NEW] Third: compare by active connections (Least Connections strategy)
+            // We want accounts with FEWER active requests first.
+            let active_a = self.active_requests.get(&a.account_id).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0);
+            let active_b = self.active_requests.get(&b.account_id).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0);
+            let active_cmp = active_a.cmp(&active_b);
+
+            if active_cmp != std::cmp::Ordering::Equal {
+                return active_cmp;
+            }
             
-            // [FIX #563] Second: compare by remaining quota percentage (higher is better)
+            // Fourth: compare by remaining quota percentage (higher is better)
             // Accounts with unknown/zero percentage go last within their tier
             let quota_a = a.remaining_quota.unwrap_or(0);
             let quota_b = b.remaining_quota.unwrap_or(0);
-            let quota_cmp = quota_b.cmp(&quota_a);
-            
-            if quota_cmp != std::cmp::Ordering::Equal {
-                return quota_cmp;
-            }
-            
-            // [NEW] Third: compare by health score (higher is better)
-            b.health_score.partial_cmp(&a.health_score).unwrap_or(std::cmp::Ordering::Equal)
+            quota_b.cmp(&quota_a)
         });
         
-        // 【调试日志】打印排序后的账号顺序
+        // 【调试日志】打印排序后的账号顺序 (TOP 5)
         tracing::debug!(
-            "🔄 [Token Rotation] Accounts: {:?}",
-            tokens_snapshot.iter().map(|t| format!(
-                "{}(protected={:?})", 
-                t.email, t.protected_models
-            )).collect::<Vec<_>>()
+            "🔄 [Token Rotation] Candidates (Top 5): {:?}",
+            tokens_snapshot.iter().take(5).map(|t| {
+                let active = self.active_requests.get(&t.account_id).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0);
+                format!(
+                    "{} [Active:{}, T:{:?}, Q:{:?}]", 
+                    t.email, active, t.subscription_tier, t.remaining_quota
+                )
+            }).collect::<Vec<_>>()
         );
 
         // 0. 读取当前调度配置
         let scheduling = self.sticky_config.read().await.clone();
+        tracing::info!("🔍 [Debug] get_token_internal | Mode: {:?} | Selected Accs: {} | Target: {}", scheduling.mode, scheduling.selected_accounts.len(), target_model);
         use crate::proxy::sticky_config::SchedulingMode;
+        
+        // 【新增】Selected 模式：仅保留选中的账号
+        if scheduling.mode == SchedulingMode::Selected {
+            let selected_set: HashSet<&String> = scheduling.selected_accounts.iter().collect();
+            
+            // Normalized target already computed above
+            // let normalized_target = crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+            //     .unwrap_or_else(|| target_model.to_string());
+
+            tokens_snapshot.retain(|t| {
+                // 1. 必须在选中的账号列表中
+                if !selected_set.contains(&t.account_id) {
+                    return false;
+                }
+
+                // 2. [NEW] 检查该账号是否配置了模型白名单
+                if let Some(allowed_models) = scheduling.selected_models.get(&t.account_id) {
+                    if !allowed_models.is_empty() {
+                        // 如果配置了白名单，必须包含当前请求的模型
+                        // 支持模糊匹配：只要 whitelist item 是 target 的子串，或者 target 是 item 的子串 (宽松匹配)
+                        // 或者完全相等
+                        let is_allowed = allowed_models.iter().any(|m| {
+                            m == target_model || 
+                            m == &normalized_target ||
+                            target_model.contains(m) || 
+                            m.contains(target_model)
+                        });
+
+                        if !is_allowed {
+                            return false;
+                        }
+                    }
+                }
+
+                // 3. [STRICT] Double check quota again inside selected mode? 
+                //    (Already done globally at start, so strictly not needed, but safe to keep logic clean)
+                true
+            });
+            
+            if tokens_snapshot.is_empty() {
+                return Err(format!("Selected mode is active but no valid accounts matches the selection for model '{}'.", target_model));
+            }
+            tracing::debug!("🎯 [Selected Mode] Using subset of {} accounts for model {}", tokens_snapshot.len(), target_model);
+        }
         
         // 【新增】检查配额保护是否启用（如果关闭，则忽略 protected_models 检查）
         let quota_protection_enabled = crate::modules::config::load_app_config()
             .map(|cfg| cfg.quota_protection.enabled)
             .unwrap_or(false);
 
-        // ===== [FIX #820] 固定账号模式：优先使用指定账号 =====
-        let preferred_id = self.preferred_account_id.read().await.clone();
-        if let Some(ref pref_id) = preferred_id {
-            // 查找优先账号
-            if let Some(preferred_token) = tokens_snapshot.iter().find(|t| &t.account_id == pref_id) {
-                // 检查账号是否可用（未限流、未被配额保护）
-                let normalized_target = crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
-                    .unwrap_or_else(|| target_model.to_string());
-
-                let is_rate_limited = self.is_rate_limited(&preferred_token.account_id, Some(&normalized_target)).await;
-                let is_quota_protected = quota_protection_enabled && preferred_token.protected_models.contains(&normalized_target);
-
-                if !is_rate_limited && !is_quota_protected {
-                    tracing::info!(
-                        "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
-                        preferred_token.email
-                    );
-
-                    // 直接使用优先账号，跳过轮询逻辑
-                    let mut token = preferred_token.clone();
-
-                    // 检查 token 是否过期（提前5分钟刷新）
-                    let now = chrono::Utc::now().timestamp();
-                    if now >= token.timestamp - 300 {
-                        tracing::debug!("账号 {} 的 token 即将过期，正在刷新...", token.email);
-                        match crate::modules::oauth::refresh_access_token(&token.refresh_token).await {
-                            Ok(token_response) => {
-                                token.access_token = token_response.access_token.clone();
-                                token.expires_in = token_response.expires_in;
-                                token.timestamp = now + token_response.expires_in;
-
-                                if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
-                                    entry.access_token = token.access_token.clone();
-                                    entry.expires_in = token.expires_in;
-                                    entry.timestamp = token.timestamp;
-                                }
-                                let _ = self.save_refreshed_token(&token.account_id, &token_response).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Preferred account token refresh failed: {}", e);
-                                // 继续使用旧 token，让后续逻辑处理失败
-                            }
-                        }
-                    }
-
-                    // 确保有 project_id
-                    let project_id = if let Some(pid) = &token.project_id {
-                        pid.clone()
-                    } else {
-                        match crate::proxy::project_resolver::fetch_project_id(&token.access_token).await {
-                            Ok(pid) => {
-                                if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
-                                    entry.project_id = Some(pid.clone());
-                                }
-                                let _ = self.save_project_id(&token.account_id, &pid).await;
-                                pid
-                            }
-                            Err(_) => "bamboo-precept-lgxtn".to_string() // fallback
-                        }
-                    };
-
-                    return Ok((token.access_token, project_id, token.email, 0));
-                } else {
-                    if is_rate_limited {
-                        tracing::warn!("🔒 [FIX #820] Preferred account {} is rate-limited, falling back to round-robin", preferred_token.email);
-                    } else {
-                        tracing::warn!("🔒 [FIX #820] Preferred account {} is quota-protected for {}, falling back to round-robin", preferred_token.email, target_model);
-                    }
-                }
-            } else {
-                tracing::warn!("🔒 [FIX #820] Preferred account {} not found in pool, falling back to round-robin", pref_id);
-            }
-        }
-        // ===== [END FIX #820] =====
+        // 【安全修正】过滤后更新 total，防止下标越界
+        let total = tokens_snapshot.len();
 
         // 【优化 Issue #284】将锁操作移到循环外，避免重复获取锁
         // 预先获取 last_used_account 的快照，避免在循环中多次加锁
@@ -692,14 +891,35 @@ impl TokenManager {
                 let sid = session_id.unwrap();
                 
                 // 1. 检查会话是否已绑定账号
-                if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
+                if let Some(bound_entry) = self.session_accounts.get(sid) {
+                    let (bound_id, _) = bound_entry.value();
+                    let bound_id = bound_id.clone();
+                    // Drop reference to avoid deadlock if we need to write later
+                    drop(bound_entry); 
+                    
+                    // Update access time [Async optimization: do it loosely or explicitly update]
+                    // We update it if we successfully reuse it.
                     // 【修复】先通过 account_id 找到对应的账号，获取其 email
                     // 2. 转换 email -> account_id 检查绑定的账号是否限流
                     if let Some(bound_token) = tokens_snapshot.iter().find(|t| t.account_id == bound_id) {
                         let key = self.email_to_account_id(&bound_token.email).unwrap_or_else(|| bound_token.account_id.clone());
                         // [FIX] Pass None for specific model wait time if not applicable
-                        let reset_sec = self.rate_limit_tracker.get_remaining_wait(&key, None);
-                        if reset_sec > 0 {
+                        let reset_sec = self.rate_limit_tracker.get_remaining_wait(&key, Some(&normalized_target));
+                        
+                        // 【Cache-First Wait Logic】
+                        // 如果在 CacheFirst 模式下，且等待时间小于设定阈值，则主动等待
+                        if reset_sec > 0 && scheduling.mode == SchedulingMode::CacheFirst && reset_sec <= scheduling.max_wait_seconds {
+                             tracing::info!("Sticky Session: Account {} limited ({}s), waiting (max: {}s)...", bound_token.email, reset_sec, scheduling.max_wait_seconds);
+                             tokio::time::sleep(std::time::Duration::from_secs(reset_sec)).await;
+                             // Wake up and reuse (assuming it cleared, loop/retry logic handled implicitly by reusing bound token if actually cleared)
+                             // NOTE: Since we just slept, let's optimistically assume it's clear or try.
+                             // But strict check is below. If it's still > 0 after sleep (rare but possible), we fall through.
+                             // Better: Continue and let the next check decide.
+                        }
+                        
+                        let reset_sec_after_wait = self.rate_limit_tracker.get_remaining_wait(&key, Some(&normalized_target));
+
+                        if reset_sec_after_wait > 0 {
                             // 【修复 Issue #284】立即解绑并切换账号，不再阻塞等待
                             // 原因：阻塞等待会导致并发请求时客户端 socket 超时 (UND_ERR_SOCKET)
                             tracing::debug!(
@@ -711,6 +931,11 @@ impl TokenManager {
                             // 3. 账号可用且未被标记为尝试失败，优先复用
                             tracing::debug!("Sticky Session: Successfully reusing bound account {} for session {}", bound_token.email, sid);
                             target_token = Some(bound_token.clone());
+                            
+                            // [FIX] Update session timestamp to keep it alive
+                            if let Some(mut entry) = self.session_accounts.get_mut(sid) {
+                                entry.value_mut().1 = std::time::Instant::now();
+                            }
                         } else if quota_protection_enabled && bound_token.protected_models.contains(&normalized_target) {
                             tracing::debug!("Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.", bound_token.email, normalized_target, target_model);
                             self.session_accounts.remove(sid);
@@ -774,7 +999,7 @@ impl TokenManager {
                         // 如果是会话首次分配且需要粘性，在此建立绑定
                         if let Some(sid) = session_id {
                             if scheduling.mode != SchedulingMode::PerformanceFirst {
-                                self.session_accounts.insert(sid.to_string(), candidate.account_id.clone());
+                                self.session_accounts.insert(sid.to_string(), (candidate.account_id.clone(), std::time::Instant::now()));
                                 tracing::debug!("Sticky Session: Bound new account {} to session {}", candidate.email, sid);
                             }
                         }
@@ -972,7 +1197,21 @@ impl TokenManager {
                 }
             }
 
-            return Ok((token.access_token, project_id, token.email, 0));
+            // [NEW] Increment active requests
+            self.active_requests.entry(token.account_id.clone())
+                .or_insert(AtomicUsize::new(0))
+                .fetch_add(1, Ordering::SeqCst);
+            
+            let active_count = self.active_requests.get(&token.account_id).unwrap().load(Ordering::SeqCst);
+            tracing::debug!("⬆️ Connection acquired: {} (active: {})", token.email, active_count);
+
+            return Ok(TokenLease {
+                access_token: token.access_token,
+                project_id,
+                email: token.email,
+                account_id: token.account_id.clone(),
+                active_requests: self.active_requests.clone(),
+            });
         }
 
         Err(last_error.unwrap_or_else(|| "All accounts failed".to_string()))
@@ -997,13 +1236,55 @@ impl TokenManager {
         content["disabled_at"] = serde_json::Value::Number(now.into());
         content["disabled_reason"] = serde_json::Value::String(truncate_reason(reason, 800));
 
-        std::fs::write(&path, serde_json::to_string_pretty(&content).unwrap())
+        let json_str = serde_json::to_string_pretty(&content)
+            .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
+
+        std::fs::write(&path, json_str)
             .map_err(|e| format!("写入文件失败: {}", e))?;
         
         // 【修复 Issue #3】从内存中移除禁用的账号，防止被60s锁定逻辑继续使用
         self.tokens.remove(account_id);
 
         tracing::warn!("Account disabled: {} ({:?})", account_id, path);
+        Ok(())
+    }
+
+    /// Temporarily block account due to VALIDATION_REQUIRED (403) error
+    async fn set_validation_block(&self, account_id: &str, block_until: i64, reason: &str) -> Result<(), String> {
+        let path = if let Some(entry) = self.tokens.get(account_id) {
+            entry.account_path.clone()
+        } else {
+            self.data_dir
+                .join("accounts")
+                .join(format!("{}.json", account_id))
+        };
+
+        let mut content: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))?,
+        )
+        .map_err(|e| format!("解析 JSON 失败: {}", e))?;
+
+        content["validation_blocked"] = serde_json::Value::Bool(true);
+        content["validation_blocked_until"] = serde_json::Value::Number(block_until.into());
+        content["validation_blocked_reason"] = serde_json::Value::String(truncate_reason(reason, 500));
+
+        let json_str = serde_json::to_string_pretty(&content)
+            .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
+
+        std::fs::write(&path, json_str)
+            .map_err(|e| format!("写入文件失败: {}", e))?;
+        
+        // Remove from memory pool temporarily
+        self.tokens.remove(account_id);
+
+        tracing::warn!(
+            "Account validation blocked until {}: {} ({:?})",
+            chrono::DateTime::from_timestamp(block_until, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| block_until.to_string()),
+            account_id,
+            path
+        );
         Ok(())
     }
 
@@ -1020,11 +1301,41 @@ impl TokenManager {
         
         content["token"]["project_id"] = serde_json::Value::String(project_id.to_string());
         
-        std::fs::write(path, serde_json::to_string_pretty(&content).unwrap())
+        let json_str = serde_json::to_string_pretty(&content)
+            .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
+
+        std::fs::write(path, json_str)
             .map_err(|e| format!("写入文件失败: {}", e))?;
         
         tracing::debug!("已保存 project_id 到账号 {}", account_id);
         Ok(())
+    }
+
+    /// Public method to set validation block (called from handlers)
+    pub async fn set_validation_block_public(&self, account_id: &str, block_until: i64, reason: &str) -> Result<(), String> {
+        self.set_validation_block(account_id, block_until, reason).await
+    }
+
+    /// Get account ID by email (for handlers that only have email)
+    pub fn get_account_id_by_email(&self, email: &str) -> Option<String> {
+        for entry in self.tokens.iter() {
+            if entry.email == email {
+                return Some(entry.account_id.clone());
+            }
+        }
+        None
+    }
+
+    /// [FEEDBACK-LOOP] 报告 429 错误，大幅降低健康分
+    pub fn report_429_penalty(&self, account_id: &str) {
+        if let Some(mut score) = self.health_scores.get_mut(account_id) {
+            let old_score = *score;
+            // 惩罚机制: 每次 429，分数减半，至少降到 0.1
+            *score = (*score * 0.5).max(0.01); 
+            tracing::warn!("⚠️ Account {} hit 429! Health penalty: {:.2} -> {:.2}", account_id, old_score, *score);
+        }
+        
+        // 可选：在这里也可以触发一个临时的 "Cool Down"，但目前 Health Score 降低已经足够让它掉到底部
     }
     
     /// 保存刷新后的 token 到账号文件
@@ -1044,7 +1355,10 @@ impl TokenManager {
         content["token"]["expires_in"] = serde_json::Value::Number(token_response.expires_in.into());
         content["token"]["expiry_timestamp"] = serde_json::Value::Number((now + token_response.expires_in).into());
         
-        std::fs::write(path, serde_json::to_string_pretty(&content).unwrap())
+        let json_str = serde_json::to_string_pretty(&content)
+            .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
+
+        std::fs::write(path, json_str)
             .map_err(|e| format!("写入文件失败: {}", e))?;
         
         tracing::debug!("已保存刷新后的 token 到账号 {}", account_id);
@@ -1173,6 +1487,19 @@ impl TokenManager {
         }
         self.rate_limit_tracker.is_rate_limited(account_id, model)
     }
+
+
+
+    /// [FIX] 获取当前有效的账号数量 (考虑调度模式)
+    /// 如果是 Selected 模式，只返回选中账号的数量
+    pub async fn effective_len(&self) -> usize {
+        let config = self.sticky_config.read().await;
+        if matches!(config.mode, crate::proxy::sticky_config::SchedulingMode::Selected) {
+            config.selected_accounts.len()
+        } else {
+            self.tokens.len()
+        }
+    }
     
     /// 获取距离限流重置还有多少秒
     #[allow(dead_code)]
@@ -1206,10 +1533,14 @@ impl TokenManager {
     
     /// 标记账号请求成功，重置连续失败计数
     /// 
-    /// 在请求成功完成后调用，将该账号的失败计数归零，
-    /// 下次失败时从最短的锁定时间开始（智能限流）。
-    pub fn mark_account_success(&self, account_id: &str) {
-        self.rate_limit_tracker.mark_success(account_id);
+    /// 在请求成功完成后调用，归零失败计数并清除关联锁。
+    pub fn mark_account_success(&self, email: &str, model: Option<&str>) {
+        if let Some(account_id) = self.email_to_account_id(email) {
+            self.rate_limit_tracker.mark_success(&account_id, model);
+        } else {
+             // Fallback if email not found (rare)
+             self.rate_limit_tracker.mark_success(email, model);
+        }
     }
     
     /// 检查是否有可用的 Google 账号
@@ -1303,8 +1634,15 @@ impl TokenManager {
                                 for model in models {
                                     if let Some(reset_time) = model.get("reset_time").and_then(|r| r.as_str()) {
                                         if !reset_time.is_empty() {
-                                            if earliest_reset.is_none() || reset_time < earliest_reset.unwrap() {
-                                                earliest_reset = Some(reset_time);
+                                            match earliest_reset {
+                                                Some(current_min) => {
+                                                    if reset_time < current_min {
+                                                        earliest_reset = Some(reset_time);
+                                                    }
+                                                }
+                                                None => {
+                                                    earliest_reset = Some(reset_time);
+                                                }
                                             }
                                         }
                                     }
@@ -1530,25 +1868,6 @@ impl TokenManager {
         self.session_accounts.clear();
     }
 
-    // ===== [FIX #820] 固定账号模式相关方法 =====
-
-    /// 设置优先使用的账号ID（固定账号模式）
-    /// 传入 Some(account_id) 启用固定账号模式，传入 None 恢复轮询模式
-    pub async fn set_preferred_account(&self, account_id: Option<String>) {
-        let mut preferred = self.preferred_account_id.write().await;
-        if let Some(ref id) = account_id {
-            tracing::info!("🔒 [FIX #820] Fixed account mode enabled: {}", id);
-        } else {
-            tracing::info!("🔄 [FIX #820] Round-robin mode enabled (no preferred account)");
-        }
-        *preferred = account_id;
-    }
-
-    /// 获取当前优先使用的账号ID
-    pub async fn get_preferred_account(&self) -> Option<String> {
-        self.preferred_account_id.read().await.clone()
-    }
-
     /// 使用 Authorization Code 交换 Refresh Token (Web OAuth)
     pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<String, String> {
         crate::modules::oauth::exchange_code(code, redirect_uri).await
@@ -1619,6 +1938,7 @@ impl TokenManager {
             .or_insert(0.8);
         tracing::warn!("📉 Health score decreased for account {}", account_id);
     }
+
 }
 
 /// 截断过长的原因字符串

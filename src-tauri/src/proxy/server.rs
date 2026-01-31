@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicUsize;
 use futures::TryFutureExt;
 use serde::{Deserialize, Serialize};
 use crate::modules::{account, logger, proxy_db, config, token_stats, migration};
-use crate::models::AppConfig;
+use crate::models::{Account, AppConfig, QuotaData, DeviceProfile};
 
 /// Axum 应用状态
 #[derive(Clone)]
@@ -128,14 +128,13 @@ pub struct AxumServer {
     shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>,
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
-    upstream: Arc<crate::proxy::upstream::client::UpstreamClient>,
     security_state: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,
     zai_state: Arc<RwLock<crate::proxy::ZaiConfig>>,
     experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
     debug_logging: Arc<RwLock<crate::proxy::config::DebugLoggingConfig>>,
     pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
     pub is_running: Arc<RwLock<bool>>,
-    pub token_manager: Arc<TokenManager>, // [NEW] 暴露出 TokenManager 供反代服务复用
+    pub upstream: Arc<crate::proxy::upstream::client::UpstreamClient>, // [NEW] Upstream client handle for hot-reloading
 }
 
 impl AxumServer {
@@ -150,8 +149,12 @@ impl AxumServer {
     /// 更新代理配置
     pub async fn update_proxy(&self, new_config: crate::proxy::config::UpstreamProxyConfig) {
         let mut proxy = self.proxy_state.write().await;
-        *proxy = new_config;
-        tracing::info!("上游代理配置已热更新");
+        *proxy = new_config.clone();
+        
+        // [FIX] 同时更新底层的 reqwest Client
+        self.upstream.rebuild_client(Some(new_config)).await;
+        
+        tracing::info!("上游代理配置已热更新 (包括底层 HTTP Client)");
     }
 
     pub async fn update_security(&self, config: &crate::proxy::config::ProxyConfig) {
@@ -178,11 +181,6 @@ impl AxumServer {
         tracing::info!("调试日志配置已热更新");
     }
 
-    pub async fn update_user_agent(&self, config: &crate::proxy::config::ProxyConfig) {
-        self.upstream.set_user_agent_override(config.user_agent_override.clone()).await;
-        tracing::info!("User-Agent 配置已热更新: {:?}", config.user_agent_override);
-    }
-
     pub async fn set_running(&self, running: bool) {
         let mut r = self.is_running.write().await;
         *r = running;
@@ -197,7 +195,6 @@ impl AxumServer {
         custom_mapping: std::collections::HashMap<String, String>,
         _request_timeout: u64,
         upstream_proxy: crate::proxy::config::UpstreamProxyConfig,
-        user_agent_override: Option<String>,
         security_config: crate::proxy::ProxySecurityConfig,
         zai_config: crate::proxy::ZaiConfig,
         monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
@@ -217,6 +214,11 @@ impl AxumServer {
             let debug_logging_state = Arc::new(RwLock::new(debug_logging));
             let is_running_state = Arc::new(RwLock::new(true));
 
+            // [FIX] Create upstream client once and share between AppState and AxumServer
+            let upstream_client = Arc::new(crate::proxy::upstream::client::UpstreamClient::new(Some(
+                upstream_proxy.clone(),
+            )));
+
 	        let state = AppState {
 	            token_manager: token_manager.clone(),
 	            custom_mapping: custom_mapping_state.clone(),
@@ -225,16 +227,7 @@ impl AxumServer {
                 std::collections::HashMap::new(),
             )),
             upstream_proxy: proxy_state.clone(),
-            upstream: {
-                let u = Arc::new(crate::proxy::upstream::client::UpstreamClient::new(Some(
-                    upstream_proxy.clone(),
-                )));
-                // 初始化 User-Agent 覆盖
-                if user_agent_override.is_some() {
-                    u.set_user_agent_override(user_agent_override).await;
-                }
-                u
-            },
+            upstream: upstream_client.clone(),
             zai: zai_state.clone(),
             provider_rr: provider_rr.clone(),
             zai_vision_mcp: zai_vision_mcp_state,
@@ -255,13 +248,11 @@ impl AxumServer {
         use crate::proxy::handlers;
         use crate::proxy::middleware::{
             auth_middleware, admin_auth_middleware, monitor_middleware, 
-            service_status_middleware, cors_layer, ip_filter_middleware
+            service_status_middleware, cors_layer
         };
 
         // 1. 构建主 AI 代理路由 (遵循 auth_mode 配置)
         let proxy_routes = Router::new()
-            .route("/health", get(health_check_handler))
-            .route("/healthz", get(health_check_handler))
             // OpenAI Protocol
             .route("/v1/models", get(handlers::openai::handle_list_models))
             .route(
@@ -325,8 +316,7 @@ impl AxumServer {
             .route("/v1/api/event_logging", post(silent_ok_handler))
             // 应用 AI 服务特定的层
             .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
-            .layer(axum::middleware::from_fn_with_state(state.clone(), monitor_middleware))
-            .layer(axum::middleware::from_fn_with_state(state.clone(), ip_filter_middleware));
+            .layer(axum::middleware::from_fn_with_state(state.clone(), monitor_middleware));
 
         // 2. 构建管理 API (强制鉴权)
         let admin_routes = Router::new()
@@ -376,10 +366,6 @@ impl AxumServer {
             .route("/proxy/session-bindings/clear", post(admin_clear_proxy_session_bindings))
             .route("/proxy/rate-limits", delete(admin_clear_all_rate_limits))
             .route("/proxy/rate-limits/:accountId", delete(admin_clear_rate_limit))
-            .route(
-                "/proxy/preferred-account",
-                get(admin_get_preferred_account).post(admin_set_preferred_account),
-            )
             .route("/accounts/oauth/prepare", post(admin_prepare_oauth_url))
             .route("/accounts/oauth/start", post(admin_start_oauth_login))
             .route("/accounts/oauth/complete", post(admin_complete_oauth_login))
@@ -492,14 +478,13 @@ impl AxumServer {
             shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
-            upstream: state.upstream.clone(),
             security_state,
             zai_state,
             experimental: experimental_state.clone(),
             debug_logging: debug_logging_state.clone(),
             cloudflared_state,
             is_running: is_running_state,
-            token_manager: token_manager.clone(),
+            upstream: upstream_client, // [NEW] Store upstream client handle
         };
 
         // 在新任务中启动服务器
@@ -512,18 +497,9 @@ impl AxumServer {
                 tokio::select! {
                     res = listener.accept() => {
                         match res {
-                            Ok((stream, remote_addr)) => {
+                            Ok((stream, _)) => {
                                 let io = TokioIo::new(stream);
-                                
-                                // 注入 ConnectInfo (用于获取真实 IP)
-                                use tower::ServiceExt;
-                                use hyper::body::Incoming;
-                                let app_with_info = app.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
-                                    req.extensions_mut().insert(axum::extract::ConnectInfo(remote_addr));
-                                    req
-                                });
-
-                                let service = TowerToHyperService::new(app_with_info);
+                                let service = TowerToHyperService::new(app.clone());
 
                                 tokio::task::spawn(async move {
                                     if let Err(err) = http1::Builder::new()
@@ -569,8 +545,7 @@ impl AxumServer {
 /// 健康检查处理器
 async fn health_check_handler() -> Response {
     Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION")
+        "status": "ok"
     }))
     .into_response()
 }
@@ -591,7 +566,7 @@ async fn silent_ok_handler() -> Response {
 async fn admin_list_accounts(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let accounts = state.account_service.list_accounts().map_err(|e| {
+    let accounts = state.account_service.list_accounts().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -1101,27 +1076,6 @@ async fn admin_clear_rate_limit(
     } else {
         StatusCode::NOT_FOUND
     }
-}
-
-async fn admin_get_preferred_account(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let pref = state.token_manager.get_preferred_account().await;
-    Json(pref)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetPreferredAccountRequest {
-    account_id: Option<String>,
-}
-
-async fn admin_set_preferred_account(
-    State(state): State<AppState>,
-    Json(payload): Json<SetPreferredAccountRequest>,
-) -> impl IntoResponse {
-    state.token_manager.set_preferred_account(payload.account_id).await;
-    StatusCode::OK
 }
 
 async fn admin_fetch_zai_models(

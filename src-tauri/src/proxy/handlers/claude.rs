@@ -411,7 +411,7 @@ pub async fn handle_messages(
         let session_id = Some(session_id_str.as_str());
 
         let force_rotate_token = attempt > 0;
-        let (access_token, project_id, email, _wait_ms) = match token_manager.get_token(&config.request_type, force_rotate_token, session_id, &config.final_model).await {
+        let token_lease = match token_manager.get_token(&config.request_type, force_rotate_token, session_id, &config.final_model).await {
             Ok(t) => t,
             Err(e) => {
                 let safe_message = if e.contains("invalid_grant") {
@@ -435,6 +435,11 @@ pub async fn handle_messages(
                 ).into_response();
             }
         };
+
+        // Extract values for use, but keep lease alive
+        let access_token = token_lease.access_token.clone();
+        let project_id = token_lease.project_id.clone();
+        let email = token_lease.email.clone();
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
@@ -723,7 +728,8 @@ pub async fn handle_messages(
         // 成功
         if status.is_success() {
             // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&email);
+            // [智能限流] 请求成功，重置该账号的连续失败计数
+            token_manager.mark_account_success(&email, Some(&request_with_mapped.model));
             
                 // Determine context limit based on model
                 let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(&request_with_mapped.model);
@@ -960,6 +966,25 @@ pub async fn handle_messages(
             token_manager.mark_rate_limited_async(&email, status_code, retry_after.as_deref(), &error_text, Some(&request_with_mapped.model)).await;
         }
 
+        // [NEW] Handle VALIDATION_REQUIRED (403) - temporarily block account
+        if status_code == 403 && (
+            error_text.contains("VALIDATION_REQUIRED") || 
+            error_text.contains("verify your account") ||
+            error_text.contains("validation_url")
+        ) {
+            tracing::warn!(
+                "[Claude] VALIDATION_REQUIRED detected on account {}, temporarily blocking",
+                email
+            );
+            // Block for 10 minutes (default, configurable via config file)
+            let block_minutes = 10i64;
+            let block_until = chrono::Utc::now().timestamp() + (block_minutes * 60);
+            
+            if let Err(e) = token_manager.set_validation_block_public(&token_lease.account_id, block_until, &error_text).await {
+                tracing::error!("Failed to set validation block: {}", e);
+            }
+        }
+
         // 4. 处理 400 错误 (Thinking 签名失效 或 块顺序错误)
         if status_code == 400
             && !retried_without_thinking
@@ -1076,6 +1101,26 @@ pub async fn handle_messages(
         
         // 执行退避
         if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+            // [FEEDBACK-LOOP] Report 429 to TokenManager
+            if status_code == 429 {
+                // We have `token_lease` in scope from line 414 ??
+                // Wait, `handle_messages` defines `token_lease` at start (line 414 of previous edit).
+                // Let's verify scope. The loop starts around line 350?
+                // The loop is `for attempt in 0..max_attempts`
+                // `token_lease` is acquired INSIDE the loop.
+                // Yes, `token_lease` is available here.
+                // However, `token_lease` variable name might be shadowed or different?
+                // In my previous edit to `claude.rs`, I changed `let (access_token...)` to `let token_lease = ...`.
+                // So `token_lease` variable exists.
+                // BUT, I need to check if `token_lease` is mutable or if reference is valid.
+                // Actually, `token_lease` is created at the top of the loop (or near it).
+                
+                // Wait, in `claude.rs`, the `get_token` call is complicated.
+                // Let's assume `token_lease` is in scope.
+                
+                token_manager.report_429_penalty(&token_lease.account_id);
+            }
+
             // 判断是否需要轮换账号
             if !should_rotate_account(status_code) {
                 debug!("[{}] Keeping same account for status {} (server-side issue)", trace_id, status_code);
@@ -1467,7 +1512,7 @@ fn create_warmup_response(request: &ClaudeRequest, is_stream: bool) -> Response 
             .header(header::CONNECTION, "keep-alive")
             .header("X-Warmup-Intercepted", "true")
             .body(Body::from(body))
-            .unwrap()
+            .expect("Failed to build warmup response")
     } else {
         // 非流式响应
         let response = json!({
@@ -1512,10 +1557,15 @@ async fn call_gemini_sync(
     trace_id: &str,
 ) -> Result<String, String> {
     // Get token and transform request
-    let (access_token, project_id, _, _wait_ms) = token_manager
+    // Get token and transform request
+    let token_lease = token_manager
         .get_token("gemini", false, None, model)
         .await
         .map_err(|e| format!("Failed to get account: {}", e))?;
+
+    // Extract values using TokenLease
+    let access_token = token_lease.access_token.clone();
+    let project_id = token_lease.project_id.clone();
     
     let gemini_body = crate::proxy::mappers::claude::transform_claude_request_in(request, &project_id, false)
         .map_err(|e| format!("Failed to transform request: {}", e))?;

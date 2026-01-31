@@ -22,9 +22,7 @@
         "warning": "تحذير",
         "info": "معلومات",
         "details": "التفاصيل",
-        "example": "Example",
         "clear": "مسح",
-        "clearing": "جاري المسح...",
         "prev_page": "السابق",
         "next_page": "التالي",
         "pagination_info": "عرض {{start}} إلى {{end}} من {{total}} مدخلاً",
@@ -42,7 +40,6 @@
         "accounts": "الحسابات",
         "proxy": "وكيل API",
         "call_records": "سجلات المرور",
-        "security": "إدارة IP",
         "token_stats": "إحصائيات Token",
         "settings": "الإعدادات",
         "theme_to_dark": "الوضع الداكن",
@@ -64,11 +61,7 @@
         "switch_to_portuguese": "Switch to Portuguese",
         "switch_to_portuguese_short": "PT",
         "switch_to_korean": "Switch to Korean",
-        "switch_to_korean_short": "KO",
-        "switch_to_spanish": "Switch to Spanish",
-        "switch_to_spanish_short": "ES",
-        "switch_to_malay": "Switch to Malay",
-        "switch_to_malay_short": "MY"
+        "switch_to_korean_short": "KO"
     },
     "dashboard": {
         "hello": "مرحبًا، المستخدم 👋",
@@ -366,14 +359,6 @@
             "clear_logs_title": "تأكيد مسح السجلات",
             "clear_logs_msg": "هل أنت متأكد من رغبتك في مسح كافة ملفات تخزين السجلات؟",
             "logs_cleared": "تم مسح تخزين السجلات",
-            "antigravity_cache_title": "تنظيف ذاكرة التخزين المؤقت لـ Antigravity",
-            "antigravity_cache_desc": "يمكن أن يؤدي مسح ذاكرة التخزين المؤقت لـ Antigravity إلى حل أخطاء تسجيل الدخول وأخطاء التحقق من الإصدار وأخطاء ترخيص OAuth.",
-            "antigravity_cache_warning": "يرجى التأكد من إغلاق Antigravity بالكامل قبل مسح ذاكرة التخزين المؤقت.",
-            "clear_antigravity_cache": "مسح ذاكرة التخزين المؤقت لـ Antigravity",
-            "clear_cache_confirm_title": "تأكيد مسح ذاكرة التخزين المؤقت لـ Antigravity",
-            "clear_cache_confirm_msg": "سيتم مسح دلائل ذاكرة التخزين المؤقت التالية:",
-            "cache_cleared_success": "تم مسح ذاكرة التخزين المؤقت، تم تحرير {{size}} ميجابايت",
-            "cache_not_found": "لم يتم العثور على دلائل ذاكرة التخزين المؤقت لـ Antigravity",
             "http_api_title": "خدمة HTTP API",
             "http_api_desc": "توفر واجهة HTTP محلية للبرامج الخارجية (مثل إضافات VS Code).",
             "http_api_enabled": "تفعيل HTTP API",
@@ -433,12 +418,6 @@
         },
         "config": {
             "title": "تكوين الخدمة",
-            "request": {
-                "user_agent": "User-Agent Override",
-                "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",
-                "user_agent_hint": "Current Default: antigravity/<version> <os>/<arch>",
-                "user_agent_placeholder": "Enter custom User-Agent string..."
-            },
             "port": "منفذ الاستماع",
             "port_tooltip": "منفذ TCP الذي يستمع إليه وكيل API المحلي. أوقف الخدمة لتغييره، ثم أعد التشغيل للتطبيق.",
             "port_hint": "الافتراضي 8045، مطلوب إعادة التشغيل لتطبيق التغييرات",

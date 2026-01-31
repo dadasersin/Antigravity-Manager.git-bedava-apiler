@@ -33,9 +33,9 @@ import { useProxyModels } from '../hooks/useProxyModels';
 import GroupedSelect, { SelectOption } from '../components/common/GroupedSelect';
 import { CliSyncCard } from '../components/proxy/CliSyncCard';
 import DebouncedSlider from '../components/common/DebouncedSlider';
-import { listAccounts } from '../services/accountService';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
 import { CircuitBreakerConfig } from '../types/config';
+import SchedulingSettings from '../components/settings/SchedulingSettings';
 
 interface ProxyStatus {
     running: boolean;
@@ -167,20 +167,15 @@ export default function ApiProxy() {
     const [isEditingApiKey, setIsEditingApiKey] = useState(false);
     const [tempApiKey, setTempApiKey] = useState('');
 
+    // Admin Password editing states
     const [isEditingAdminPassword, setIsEditingAdminPassword] = useState(false);
     const [tempAdminPassword, setTempAdminPassword] = useState('');
-
-    // Modal states
 
     // Modal states
     const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
     const [isRegenerateKeyConfirmOpen, setIsRegenerateKeyConfirmOpen] = useState(false);
     const [isClearBindingsConfirmOpen, setIsClearBindingsConfirmOpen] = useState(false);
     const [isClearRateLimitsConfirmOpen, setIsClearRateLimitsConfirmOpen] = useState(false);
-
-    // [FIX #820] Fixed account mode states
-    const [preferredAccountId, setPreferredAccountId] = useState<string | null>(null);
-    const [availableAccounts, setAvailableAccounts] = useState<Array<{ id: string; email: string }>>([]);
 
     // Cloudflared (CF隧道) states
     const [cfStatus, setCfStatus] = useState<{ installed: boolean; version?: string; running: boolean; url?: string; error?: string }>({
@@ -215,8 +210,6 @@ export default function ApiProxy() {
     useEffect(() => {
         loadConfig();
         loadStatus();
-        loadAccounts();
-        loadPreferredAccount();
         loadCfStatus();
         const interval = setInterval(loadStatus, 3000);
         const cfInterval = setInterval(loadCfStatus, 5000);
@@ -225,18 +218,6 @@ export default function ApiProxy() {
             clearInterval(cfInterval);
         };
     }, []);
-
-
-
-    // [FIX #820] Load available accounts for fixed account mode
-    const loadAccounts = async () => {
-        try {
-            const accounts = await listAccounts();
-            setAvailableAccounts(accounts.map(a => ({ id: a.id, email: a.email })));
-        } catch (error) {
-            console.error('Failed to load accounts:', error);
-        }
-    };
 
     // Cloudflared: 检查状态
     const loadCfStatus = async () => {
@@ -317,45 +298,6 @@ export default function ApiProxy() {
                 setCopied('cf-url');
                 setTimeout(() => setCopied(null), 2000);
             }
-        }
-    };
-
-    // [FIX #820] Load current preferred account
-    const loadPreferredAccount = async () => {
-        try {
-            const prefId = await invoke<string | null>('get_preferred_account');
-            setPreferredAccountId(prefId);
-        } catch (error) {
-            // Service not running, ignore
-        }
-    };
-
-    // [FIX #820] Set preferred account
-    const handleSetPreferredAccount = async (accountId: string | null) => {
-        try {
-            const wasEnabled = preferredAccountId !== null;
-            await invoke('set_preferred_account', { accountId });
-            setPreferredAccountId(accountId);
-
-            // Determine appropriate message
-            let message: string;
-            if (accountId === null) {
-                message = t('proxy.config.scheduling.round_robin_set', { defaultValue: 'Round-robin mode enabled' });
-            } else if (wasEnabled) {
-                // Changed account while already in fixed mode
-                const account = availableAccounts.find(a => a.id === accountId);
-                message = t('proxy.config.scheduling.account_changed', {
-                    defaultValue: `Switched to ${account?.email || accountId}`,
-                    email: account?.email || accountId
-                });
-            } else {
-                // Just enabled fixed mode
-                message = t('proxy.config.scheduling.fixed_account_set', { defaultValue: 'Fixed account mode enabled' });
-            }
-
-            showToast(message, 'success');
-        } catch (error) {
-            showToast(String(error), 'error');
         }
     };
 
@@ -508,8 +450,17 @@ export default function ApiProxy() {
 
     const updateSchedulingConfig = (updates: Partial<StickySessionConfig>) => {
         if (!appConfig) return;
-        const currentScheduling = appConfig.proxy.scheduling || { mode: 'Balance', max_wait_seconds: 60 };
-        const newScheduling = { ...currentScheduling, ...updates };
+        const currentScheduling = appConfig.proxy.scheduling || { 
+            mode: 'Balance', 
+            max_wait_seconds: 60,
+            selected_accounts: [],
+            selected_models: {}
+        };
+        const newScheduling: StickySessionConfig = { 
+            ...currentScheduling, 
+            ...updates,
+            selected_accounts: updates.selected_accounts ?? currentScheduling.selected_accounts ?? []
+        };
 
         const newAppConfig = {
             ...appConfig,
@@ -866,7 +817,7 @@ print(response.text)`;
                         <div className="flex flex-col items-center gap-4">
                             <RefreshCw size={32} className="animate-spin text-blue-500" />
                             <span className="text-sm text-gray-500 dark:text-gray-400">
-                                {t('common.loading')}
+                                {t('common.loading') || 'Loading...'}
                             </span>
                         </div>
                     </div>
@@ -881,7 +832,7 @@ print(response.text)`;
                             </div>
                             <div className="space-y-2">
                                 <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                                    {t('proxy.error.load_failed')}
+                                    {t('proxy.error.load_failed') || 'Failed to load configuration'}
                                 </h3>
                                 <p className="text-sm text-gray-500 dark:text-gray-400 max-w-md">
                                     {configError}
@@ -892,7 +843,7 @@ print(response.text)`;
                                 className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
                             >
                                 <RefreshCw size={16} />
-                                {t('common.retry')}
+                                {t('common.retry') || 'Retry'}
                             </button>
                         </div>
                     </div>
@@ -912,7 +863,7 @@ print(response.text)`;
                                     <div className={`w-2 h-2 rounded-full ${status.running ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`} />
                                     <span className={`text-xs font-medium ${status.running ? 'text-green-600' : 'text-gray-500'}`}>
                                         {status.running
-                                            ? `${t('proxy.status.running')} (${status.active_accounts} ${t('common.accounts')})`
+                                            ? `${t('proxy.status.running')} (${status.active_accounts} ${t('common.accounts') || 'Accounts'})`
                                             : t('proxy.status.stopped')}
                                     </span>
                                 </div>
@@ -1258,57 +1209,6 @@ print(response.text)`;
                                 </p>
                             </div>
 
-                            {/* User-Agent Overrides */}
-                            <div className="border-t border-gray-200 dark:border-base-300 pt-3 mt-3">
-                                <div className="flex items-center justify-between mb-2">
-                                    <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
-                                        {t('proxy.config.request.user_agent', { defaultValue: 'User-Agent Override' })}
-                                        <HelpTooltip text={t('proxy.config.request.user_agent_tooltip', { defaultValue: 'Override the User-Agent header sent to upstream APIs.' })} />
-                                    </label>
-                                    <input
-                                        type="checkbox"
-                                        className="toggle toggle-sm bg-gray-200 dark:bg-gray-700 border-gray-300 dark:border-gray-600 checked:bg-blue-500 checked:border-blue-500"
-                                        checked={!!appConfig.proxy.user_agent_override}
-                                        onChange={(e) => {
-                                            const enabled = e.target.checked;
-                                            if (enabled) {
-                                                // Restore saved override from config or use default
-                                                const restoredValue = appConfig.proxy.saved_user_agent || 'antigravity/1.15.8 darwin/arm64';
-                                                updateProxyConfig({
-                                                    user_agent_override: restoredValue,
-                                                    saved_user_agent: restoredValue
-                                                });
-                                            } else {
-                                                // Disable active override but keep saved value
-                                                updateProxyConfig({ user_agent_override: undefined });
-                                            }
-                                        }}
-                                    />
-                                </div>
-
-                                {!!appConfig.proxy.user_agent_override && (
-                                    <div className="space-y-2 animate-in fade-in slide-in-from-top-1 duration-200">
-                                        <input
-                                            type="text"
-                                            value={appConfig.proxy.user_agent_override}
-                                            onChange={(e) => {
-                                                const newValue = e.target.value;
-                                                updateProxyConfig({
-                                                    user_agent_override: newValue,
-                                                    saved_user_agent: newValue
-                                                });
-                                            }}
-                                            className="w-full px-2.5 py-1.5 border border-gray-300 dark:border-base-200 rounded-lg bg-white dark:bg-base-200 text-xs font-mono text-gray-900 dark:text-base-content focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                            placeholder={t('proxy.config.request.user_agent_placeholder', { defaultValue: 'Enter custom User-Agent string...' })}
-                                        />
-                                        <div className="bg-gray-50 dark:bg-base-300 rounded p-2 text-[10px] text-gray-500 font-mono break-all">
-                                            <span className="font-bold select-none mr-2">{t('common.example', { defaultValue: 'Example' })}:</span>
-                                            antigravity/1.15.8 darwin/arm64
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-
 
                         </div>
                     </div>
@@ -1414,7 +1314,7 @@ print(response.text)`;
                                                                 value=""
                                                                 onChange={(e) => e.target.value && updateZaiDefaultModels({ [family]: e.target.value })}
                                                             >
-                                                                <option value="">{t('proxy.config.zai.models.select_placeholder')}</option>
+                                                                <option value="">Select</option>
                                                                 {zaiModelOptions.map(m => <option key={m} value={m}>{m}</option>)}
                                                             </select>
                                                         )}
@@ -1560,142 +1460,25 @@ print(response.text)`;
                             <CollapsibleCard
                                 title={t('proxy.config.scheduling.title')}
                                 icon={<RefreshCw size={18} className="text-indigo-500" />}
+                                rightElement={
+                                    <button
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleClearSessionBindings();
+                                        }}
+                                        className="text-[10px] text-indigo-500 hover:text-indigo-600 transition-colors flex items-center gap-1 bg-indigo-50 dark:bg-indigo-900/30 px-2 py-1 rounded-md border border-indigo-100 dark:border-indigo-800"
+                                        title={t('proxy.config.scheduling.clear_bindings_tooltip')}
+                                    >
+                                        <Trash2 size={12} />
+                                        {t('proxy.config.scheduling.clear_bindings')}
+                                    </button>
+                                }
                             >
                                 <div className="space-y-4">
-                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                        <div className="space-y-3">
-                                            <div className="flex items-center justify-between">
-                                                <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
-                                                    {t('proxy.config.scheduling.mode')}
-                                                    <HelpTooltip
-                                                        text={t('proxy.config.scheduling.mode_tooltip')}
-                                                        placement="right"
-                                                    />
-                                                </label>
-                                                <div className="flex items-center gap-3">
-                                                    {/* [MOVED] Clear Rate Limit button moved to CircuitBreaker component */}
-                                                    <button
-                                                        onClick={handleClearSessionBindings}
-                                                        className="text-[10px] text-indigo-500 hover:text-indigo-600 transition-colors flex items-center gap-1"
-                                                        title={t('proxy.config.scheduling.clear_bindings_tooltip')}
-                                                    >
-                                                        <Trash2 size={12} />
-                                                        {t('proxy.config.scheduling.clear_bindings')}
-                                                    </button>
-                                                </div>
-                                            </div>
-                                            <div className="grid grid-cols-1 gap-2">
-                                                {(['CacheFirst', 'Balance', 'PerformanceFirst'] as const).map(mode => (
-                                                    <label
-                                                        key={mode}
-                                                        className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-all duration-200 ${(appConfig.proxy.scheduling?.mode || 'Balance') === mode
-                                                            ? 'border-indigo-500 bg-indigo-50/30 dark:bg-indigo-900/10'
-                                                            : 'border-gray-100 dark:border-base-200 hover:border-indigo-200'
-                                                            }`}
-                                                    >
-                                                        <input
-                                                            type="radio"
-                                                            className="radio radio-xs radio-primary mt-1"
-                                                            checked={(appConfig.proxy.scheduling?.mode || 'Balance') === mode}
-                                                            onChange={() => updateSchedulingConfig({ mode })}
-                                                        />
-                                                        <div className="space-y-1">
-                                                            <div className="text-xs font-bold text-gray-900 dark:text-base-content">
-                                                                {t(`proxy.config.scheduling.modes.${mode}`)}
-                                                            </div>
-                                                            <div className="text-[10px] text-gray-500 line-clamp-2">
-                                                                {t(`proxy.config.scheduling.modes_desc.${mode}`, {
-                                                                    defaultValue: mode === 'CacheFirst' ? 'Binds session to account, waits precisely if limited (Maximizes Prompt Cache hits).' :
-                                                                        mode === 'Balance' ? 'Binds session, auto-switches to available account if limited (Balanced cache & availability).' :
-                                                                            'No session binding, pure round-robin rotation (Best for high concurrency).'
-                                                                })}
-                                                            </div>
-                                                        </div>
-                                                    </label>
-                                                ))}
-                                            </div>
-                                        </div>
-
-                                        <div className="space-y-4 pt-1">
-                                            <div className="bg-slate-100 dark:bg-slate-800/80 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-                                                <div className="flex items-center justify-between mb-2">
-                                                    <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
-                                                        {t('proxy.config.scheduling.max_wait')}
-                                                        <HelpTooltip text={t('proxy.config.scheduling.max_wait_tooltip')} />
-                                                    </label>
-                                                    <span className="text-xs font-mono text-indigo-600 font-bold">
-                                                        {appConfig.proxy.scheduling?.max_wait_seconds || 60}s
-                                                    </span>
-                                                </div>
-                                                <input
-                                                    type="range"
-                                                    min="0"
-                                                    max="300"
-                                                    step="10"
-                                                    disabled={(appConfig.proxy.scheduling?.mode || 'Balance') !== 'CacheFirst'}
-                                                    className="range range-indigo range-xs"
-                                                    value={appConfig.proxy.scheduling?.max_wait_seconds || 60}
-                                                    onChange={(e) => updateSchedulingConfig({ max_wait_seconds: parseInt(e.target.value) })}
-                                                />
-                                                <div className="flex justify-between px-1 mt-1 text-[10px] text-gray-400 font-mono">
-                                                    <span>0s</span>
-                                                    <span>300s</span>
-                                                </div>
-                                            </div>
-
-                                            <div className="p-3 bg-amber-50 dark:bg-amber-900/10 border border-amber-100 dark:border-amber-900/20 rounded-xl">
-                                                <p className="text-[10px] text-amber-700 dark:text-amber-500 leading-relaxed">
-                                                    <strong>{t('common.info')}:</strong> {t('proxy.config.scheduling.subtitle')}
-                                                </p>
-                                            </div>
-
-                                            {/* [FIX #820] Fixed Account Mode */}
-                                            <div className="bg-indigo-50 dark:bg-indigo-900/20 rounded-xl p-4 border border-indigo-200 dark:border-indigo-800">
-                                                <div className="flex items-center justify-between mb-3">
-                                                    <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
-                                                        🔒 {t('proxy.config.scheduling.fixed_account', { defaultValue: 'Fixed Account Mode' })}
-                                                        <HelpTooltip text={t('proxy.config.scheduling.fixed_account_tooltip', { defaultValue: 'When enabled, all API requests will use only the selected account instead of rotating between accounts.' })} />
-                                                    </label>
-                                                    <input
-                                                        type="checkbox"
-                                                        className="toggle toggle-sm toggle-primary"
-                                                        checked={preferredAccountId !== null}
-                                                        onChange={(e) => {
-                                                            if (e.target.checked) {
-                                                                // Enable fixed mode with first available account
-                                                                if (availableAccounts.length > 0) {
-                                                                    handleSetPreferredAccount(availableAccounts[0].id);
-                                                                }
-                                                            } else {
-                                                                // Disable fixed mode
-                                                                handleSetPreferredAccount(null);
-                                                            }
-                                                        }}
-                                                        disabled={!status.running}
-                                                    />
-                                                </div>
-                                                {preferredAccountId !== null && (
-                                                    <select
-                                                        className="select select-bordered select-sm w-full text-xs"
-                                                        value={preferredAccountId || ''}
-                                                        onChange={(e) => handleSetPreferredAccount(e.target.value || null)}
-                                                        disabled={!status.running}
-                                                    >
-                                                        {availableAccounts.map(account => (
-                                                            <option key={account.id} value={account.id}>
-                                                                {account.email}
-                                                            </option>
-                                                        ))}
-                                                    </select>
-                                                )}
-                                                {!status.running && (
-                                                    <p className="text-[10px] text-gray-500 mt-2">
-                                                        {t('proxy.config.scheduling.start_proxy_first', { defaultValue: 'Start the proxy service to configure fixed account mode.' })}
-                                                    </p>
-                                                )}
-                                            </div>
-                                        </div>
-                                    </div>
+                                    <SchedulingSettings 
+                                        config={appConfig.proxy.scheduling} 
+                                        onChange={updateSchedulingConfig} 
+                                    />
 
                                     {/* Circuit Breaker Section */}
                                     {appConfig.circuit_breaker && (
